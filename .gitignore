@@ -1,0 +1,5 @@
+target/
+dist/
+# files KiPanel writes when you try it on the example board
+examples/panel/
+examples/*.kipanel.json

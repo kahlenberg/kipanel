@@ -1,0 +1,20 @@
+[package]
+name = "kipanel"
+version = "0.1.0"
+edition = "2021"
+description = "KiCad 9+ PCB panelizer plugin with live preview"
+license = "MIT"
+
+[dependencies]
+kicad-ipc-rs = { version = "0.5", features = ["blocking"] }
+eframe = "0.31"
+geo = "0.33.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.3", features = ["v4"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

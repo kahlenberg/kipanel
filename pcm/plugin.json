@@ -1,0 +1,19 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.mubin.kipanel",
+  "name": "KiPanel",
+  "description": "Panelizer with live preview",
+  "runtime": { "type": "exec" },
+  "actions": [
+    {
+      "identifier": "com.mubin.kipanel.open",
+      "name": "KiPanel",
+      "description": "Open panelizer",
+      "show-button": true,
+      "scopes": ["pcb"],
+      "entrypoint": "kipanel",
+      "icons-light": ["icon_light_24.png", "icon_light_48.png"],
+      "icons-dark": ["icon_dark_24.png", "icon_dark_48.png"]
+    }
+  ]
+}
