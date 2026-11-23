@@ -2,11 +2,15 @@
 
 mod board;
 mod export;
+mod optimize;
 mod panel;
 mod sexpr;
+mod tools;
+mod view3d;
+mod gl3d;
 
 use board::Outline;
-use panel::{Corners, FeatureKind, FidSide, Framing, PanelConfig, Preset, RectMm, Separation, TextPos};
+use panel::{Alternation, CornerStyle, Corners, FeatureKind, FidSide, Framing, Justify, OriginCorner, PanelConfig, Preset, RectMm, Separation, TabMode, TextCfg, TextRail};
 use std::path::PathBuf;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use kicad_ipc_rs::KiCadClientBlocking;
@@ -33,6 +37,8 @@ enum Hl {
     Tooling,
     Fiducials,
     Text,
+    Bones,
+    Copper,
 }
 
 struct App {
@@ -55,7 +61,37 @@ struct App {
     zoom: f32,
     pan: Vec2,
     fit_pending: bool,
+    /// final panel outline for the preview, recomputed only when the settings change: (settings, rings)
+    outline_cache: Option<(String, std::rc::Rc<export::OutlineGeo>)>,
+    /// preview mode: flat, or rotatable 3D view of the bare panel
+    view3d: bool,
+    cam: view3d::Camera,
+    /// board thickness from the board file (mm)
+    thickness: f64,
+    /// 3D view: draws the board model with its components at every board position
+    gl3d: gl3d::Renderer,
+    model: ModelLoad,
+    /// running kicad-cli job (DRC / render / 3D export)
+    job: Option<(tools::Job, std::sync::mpsc::Receiver<Result<tools::Done, String>>)>,
+    drc: Option<tools::DrcReport>,
+    show_drc: bool,
+    render: Option<(PathBuf, egui::TextureHandle)>,
+    show_render: bool,
+    save_render: bool,
+    /// result of the last "Fix automatically": what was changed, and the settings before (for Undo)
+    fix_log: Option<(Vec<String>, PanelConfig)>,
 }
+
+/// the board model with components for the 3D view (exported by kicad-cli in the background)
+enum ModelLoad {
+    Idle,
+    Loading(std::sync::mpsc::Receiver<Result<gl3d::MeshData, String>>),
+    Ready,
+    Failed(String),
+}
+
+/// above this many boards the exact outline is not drawn in the preview (too slow while dragging)
+const OUTLINE_PREVIEW_MAX: usize = 400;
 
 /// message in the status bar, optionally with a file the user can jump to
 #[derive(Default)]
@@ -77,7 +113,13 @@ impl Notice {
     }
 }
 
+/// board thickness from `(general (thickness 1.6))`
+fn board_thickness(root: &sexpr::Sexp) -> f64 {
+    root.child("general").and_then(|g| g.child("thickness")).and_then(|t| t.f64_at(1)).filter(|t| *t > 0.0).unwrap_or(1.6)
+}
+
 struct BoardInfo {
+    thickness: f64,
     status: String,
     outline: Outline,
     text: String,
@@ -93,7 +135,7 @@ fn load_board_file(path: &std::path::Path) -> Result<BoardInfo, String> {
     let outline = board::extract_outline(&root)?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "board".into());
     let status = format!("File mode  ·  {stem}  ·  board {:.2} × {:.2} mm", outline.width(), outline.height());
-    Ok(BoardInfo { status, outline, text, stem, project_dir: path.parent().map(|p| p.to_path_buf()), pcbnew: None })
+    Ok(BoardInfo { thickness: board_thickness(&root), status, outline, text, stem, project_dir: path.parent().map(|p| p.to_path_buf()), pcbnew: None })
 }
 
 fn load_board() -> Result<BoardInfo, String> {
@@ -146,7 +188,7 @@ fn load_board() -> Result<BoardInfo, String> {
     if outline.separate > 0 {
         status += &format!("\n⚠ {} separate outline(s) outside the main board ignored", outline.separate);
     }
-    Ok(BoardInfo { status, outline, text, stem, project_dir, pcbnew })
+    Ok(BoardInfo { thickness: board_thickness(&root), status, outline, text, stem, project_dir, pcbnew })
 }
 
 const LABEL_W: f32 = 150.0;
@@ -308,6 +350,7 @@ const HL_STROKE: Color32 = Color32::from_rgb(255, 225, 0);
 const DIM: Color32 = Color32::from_rgb(160, 180, 220);
 const VCUT: Color32 = Color32::from_rgb(255, 150, 40);
 const BAD: Color32 = Color32::from_rgb(255, 60, 60);
+const COPPER: Color32 = Color32::from_rgb(176, 120, 58);
 
 /// Numeric field in mm with label, explanation on hover. Returns true if hovered.
 fn mm_field(ui: &mut egui::Ui, label: &str, v: &mut f64, range: std::ops::RangeInclusive<f64>, help: &str) -> bool {
@@ -330,6 +373,26 @@ fn int_field(ui: &mut egui::Ui, label: &str, v: &mut u32, range: std::ops::Range
         hovered
     })
     .inner
+}
+
+/// labelled single-line text field
+fn text_field(ui: &mut egui::Ui, label: &str, v: &mut String, hint: &str, help: &str) {
+    ui.horizontal(|ui| {
+        field_label(ui, label);
+        ui.add_sized([ui.available_width() - 6.0, 22.0], egui::TextEdit::singleline(v).hint_text(hint)).on_hover_text(help);
+    });
+}
+
+/// collapsed group for rarely needed options, so the main settings stay short
+fn advanced(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(egui::RichText::new("Advanced").color(MUTED)).id_salt(id).default_open(false).show(ui, add);
+}
+
+fn load_texture(ctx: &egui::Context, path: &std::path::Path) -> Result<egui::TextureHandle, String> {
+    let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let ci = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Ok(ctx.load_texture("kipanel-render", ci, egui::TextureOptions::LINEAR))
 }
 
 fn section_title(t: &str) -> egui::RichText {
@@ -360,6 +423,19 @@ impl App {
             zoom: 1.0,
             pan: Vec2::ZERO,
             fit_pending: true,
+            outline_cache: None,
+            view3d: false,
+            cam: view3d::Camera::default(),
+            thickness: 1.6,
+            gl3d: gl3d::Renderer::default(),
+            model: ModelLoad::Idle,
+            job: None,
+            drc: None,
+            show_drc: false,
+            render: None,
+            show_render: false,
+            save_render: false,
+            fix_log: None,
         };
         app.reload();
         app
@@ -374,6 +450,7 @@ impl App {
                 self.board_stem = b.stem;
                 self.project_dir = b.project_dir;
                 self.pcbnew = b.pcbnew;
+                self.thickness = b.thickness;
                 self.load_config();
                 self.saved_json = self.cfg_json();
             }
@@ -383,7 +460,39 @@ impl App {
                 self.source = None;
             }
         }
+        self.outline_cache = None;
         self.fit_pending = true;
+        // dropping the receiver also discards a model export that is still running
+        self.model = ModelLoad::Idle;
+        self.gl3d.clear_model();
+    }
+
+    /// export the board with its components as a 3D model and load it (background thread)
+    fn start_model(&mut self, ctx: &egui::Context) {
+        let Some(src) = self.source.clone() else { return };
+        let cli = tools::find_cli(self.pcbnew.as_deref());
+        let (dir, stem) = (self.project_dir.clone(), self.board_stem.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = tools::board_glb(&cli, &src, dir.as_deref(), &stem).and_then(|b| gl3d::load_glb(&b));
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+        self.model = ModelLoad::Loading(rx);
+    }
+
+    fn poll_model(&mut self) {
+        let ModelLoad::Loading(rx) = &self.model else { return };
+        self.model = match rx.try_recv() {
+            Ok(Ok(m)) => {
+                self.gl3d.set_model(m);
+                ModelLoad::Ready
+            }
+            Ok(Err(e)) => ModelLoad::Failed(e),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => ModelLoad::Failed("the model export stopped unexpectedly".into()),
+        };
     }
 
     /// empty -> default, relative -> relative to project folder
@@ -436,14 +545,14 @@ impl App {
 
     fn load_config_from(&mut self, p: &std::path::Path) -> Result<(), String> {
         let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        self.cfg = serde_json::from_str::<PanelConfig>(&s).map_err(|e| format!("{}: {e}", p.display()))?;
+        self.cfg = PanelConfig::from_json(&s).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(())
     }
 
     fn load_config(&mut self) {
         if let Some(p) = self.default_config_path() {
             if let Ok(s) = std::fs::read_to_string(&p) {
-                if let Ok(c) = serde_json::from_str::<PanelConfig>(&s) {
+                if let Ok(c) = PanelConfig::from_json(&s) {
                     self.cfg = c;
                 }
             }
@@ -471,7 +580,7 @@ impl App {
         let o = self.outline.as_ref()?;
         let p = panel::build(o, &self.cfg);
         let sep = panel::separation(&p, &self.cfg);
-        let feats = panel::features(&p, &self.cfg, &sep.vcuts);
+        let feats = panel::features(&p, &self.cfg, &sep.vcuts, &self.board_stem);
         Some((p, sep, feats))
     }
 
@@ -514,6 +623,178 @@ impl App {
         }
     }
 
+    /// adjust the settings so the problems in the Checks list go away
+    fn auto_fix(&mut self) {
+        let Some(o) = &self.outline else { return };
+        let (fixed, changes) = optimize::optimize(o, &self.cfg, &self.board_stem);
+        if changes.is_empty() {
+            self.notice = Notice::err("Nothing here can be fixed automatically — see the Checks list for what to change by hand.");
+            return;
+        }
+        let before = std::mem::replace(&mut self.cfg, fixed);
+        self.notice = Notice::ok(format!("✔ {} setting(s) adjusted", changes.len()));
+        self.fix_log = Some((changes, before));
+        self.fit_pending = true;
+    }
+
+    /// the exported panel file the kicad-cli tools work on
+    fn panel_file(&self) -> Option<PathBuf> {
+        self.last_export.clone().or_else(|| self.out_file()).filter(|f| f.is_file())
+    }
+
+    fn start_job(&mut self, ctx: &egui::Context, job: tools::Job) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(panel) = self.panel_file() else {
+            self.notice = Notice::err("⚠ Export the panel first");
+            return;
+        };
+        let cli = tools::find_cli(self.pcbnew.as_deref());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(tools::run(&cli, &panel, job));
+            ctx.request_repaint();
+        });
+        self.notice = Notice::ok(job.label());
+        self.job = Some((job, rx));
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some((_, rx)) = &self.job else { return };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the background job stopped unexpectedly".into()),
+        };
+        self.job = None;
+        match res {
+            Ok(tools::Done::Drc(r)) => {
+                let bad = r.errors + r.unconnected;
+                let text = if bad == 0 {
+                    format!("✔ DRC: no errors, {} warning(s)", r.warnings)
+                } else {
+                    format!("⚠ DRC: {} error(s), {} unconnected, {} warning(s)", r.errors, r.unconnected, r.warnings)
+                };
+                self.notice = Notice { text, path: Some(r.report.clone()), error: bad > 0 };
+                self.drc = Some(r);
+                self.show_drc = true;
+            }
+            Ok(tools::Done::Render(p)) => match load_texture(ctx, &p) {
+                Ok(t) => {
+                    self.notice = Notice::ok_path("✔ 3D image saved", p.clone());
+                    self.render = Some((p, t));
+                    self.show_render = true;
+                }
+                Err(e) => self.notice = Notice::err(format!("⚠ Image written, but it could not be shown: {e}")),
+            },
+            Ok(tools::Done::Model(p)) => self.notice = Notice::ok_path("✔ 3D model saved", p),
+            Err(e) => self.notice = Notice::err(format!("⚠ {e}")),
+        }
+    }
+
+    /// result list of the design rule check
+    fn drc_window(&mut self, ctx: &egui::Context) {
+        let Some(r) = &self.drc else { return };
+        let mut open = self.show_drc;
+        egui::Window::new("Design rule check of the panel").open(&mut open).default_size([460.0, 420.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let part = |ui: &mut egui::Ui, n: usize, what: &str, col: Color32| {
+                    ui.label(egui::RichText::new(format!("{n} {what}")).strong().color(if n > 0 { col } else { OK_TEXT }));
+                };
+                part(ui, r.errors, "errors", ERR_TEXT);
+                part(ui, r.unconnected, "unconnected", ERR_TEXT);
+                part(ui, r.warnings, "warnings", WARN_TEXT);
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Report").small().color(MUTED));
+                path_link(ui, &r.report, 12.5);
+            });
+            if r.items.is_empty() {
+                ui.label(egui::RichText::new("✔ KiCad found no problems in the panel.").color(OK_TEXT));
+                return;
+            }
+            ui.label(egui::RichText::new("Marks in the preview show where. Most findings come from the board itself: fix them there, reload and export again.").small().color(Color32::GRAY));
+            ui.separator();
+            // group by rule, in order of first appearance
+            let mut kinds: Vec<&str> = Vec::new();
+            for it in &r.items {
+                if !kinds.contains(&it.kind.as_str()) {
+                    kinds.push(&it.kind);
+                }
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for k in kinds {
+                    let items: Vec<&tools::DrcItem> = r.items.iter().filter(|i| i.kind == k).collect();
+                    let col = if items.iter().any(|i| i.error) { ERR_TEXT } else { WARN_TEXT };
+                    let title = format!("{} × {}", items.len(), k.replace('_', " "));
+                    egui::CollapsingHeader::new(egui::RichText::new(title).color(col)).id_salt(("drc", k)).show(ui, |ui| {
+                        for it in items.iter().take(200) {
+                            let mut line = it.text.clone();
+                            if let Some((x, y)) = it.pos {
+                                line += &format!("  @ {x:.2}, {y:.2} mm");
+                            }
+                            ui.label(line);
+                            for w in &it.what {
+                                ui.label(egui::RichText::new(format!("    {w}")).small().color(MUTED));
+                            }
+                        }
+                        if items.len() > 200 {
+                            ui.label(egui::RichText::new(format!("… and {} more, see the report file", items.len() - 200)).small().color(MUTED));
+                        }
+                    });
+                }
+            });
+        });
+        self.show_drc = open;
+    }
+
+    /// the last 3D picture
+    fn render_window(&mut self, ctx: &egui::Context) {
+        let Some((path, tex)) = &self.render else { return };
+        let mut open = self.show_render;
+        let mut save = false;
+        egui::Window::new("3D picture of the panel").open(&mut open).default_size([760.0, 540.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Save a copy as…").clicked() {
+                    save = true;
+                }
+                if ui.button("Show in folder").clicked() {
+                    reveal(path);
+                }
+                path_link(ui, path, 12.5);
+            });
+            let size = tex.size_vec2();
+            let avail = ui.available_size();
+            let scale = (avail.x / size.x).min(avail.y.max(120.0) / size.y).min(1.0);
+            let (rect, _) = ui.allocate_exact_size(size * scale, Sense::hover());
+            // neutral grey behind the transparent image: boards are often dark
+            ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(96, 102, 114));
+            ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        });
+        self.show_render = open;
+        self.save_render |= save;
+    }
+
+    fn save_render_copy(&mut self) {
+        if !std::mem::take(&mut self.save_render) {
+            return;
+        }
+        let Some((path, _)) = &self.render else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "panel.png".into());
+        let mut dlg = rfd::FileDialog::new().set_file_name(name).add_filter("PNG image", &["png"]);
+        if let Some(dir) = path.parent() {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(to) = dlg.save_file() {
+            self.notice = match std::fs::copy(path, &to) {
+                Ok(_) => Notice::ok_path("✔ Image saved", to),
+                Err(e) => Notice::err(format!("⚠ {}: {e}", to.display())),
+            };
+        }
+    }
+
     fn open_in_kicad(&mut self) {
         let Some(f) = self.last_export.clone() else { return };
         let bin = self.pcbnew.clone().unwrap_or_else(|| {
@@ -546,6 +827,25 @@ impl App {
                         ui.selectable_value(&mut c.rotation, deg, format!("{deg}°"));
                     }
                 });
+                advanced(ui, "adv_layout", |ui| {
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Flip boards 180°");
+                        let r = egui::ComboBox::from_id_salt("alternation").selected_text(c.alternation.label()).show_ui(ui, |ui| {
+                            for a in Alternation::ALL { ui.selectable_value(&mut c.alternation, a, a.label()); }
+                        });
+                        if r.response.hovered() { hl = Hl::Grid; }
+                    })
+                    .response
+                    .on_hover_text("Turn every other board upside down, e.g. so connectors or odd-shaped edges face each other.");
+                    if mm_field(ui, "Extra: 2nd column gap", &mut c.hspace_alt, -50.0..=50.0, "Added to every second gap between columns (may be negative). Useful with flipped boards, where the gaps alternate.") { hl = Hl::HSpace; }
+                    if mm_field(ui, "Extra: 2nd row gap", &mut c.vspace_alt, -50.0..=50.0, "Added to every second gap between rows (may be negative)") { hl = Hl::VSpace; }
+                    ui.add_space(4.0);
+                    if mm_field(ui, "Backbone in col. gaps", &mut c.bone_cols, 0.0..=20.0, "A solid bar in the middle of the gaps between columns; boards are tabbed to it instead of to each other. Makes large panels stiffer. 0 = none. The spacing must be wider than the bar.") { hl = Hl::Bones; }
+                    if mm_field(ui, "Backbone in row gaps", &mut c.bone_rows, 0.0..=20.0, "A solid bar in the middle of the gaps between rows. 0 = none.") { hl = Hl::Bones; }
+                    if c.bone_cols > 0.0 || c.bone_rows > 0.0 {
+                        if int_field(ui, "Backbone every N gaps", &mut c.bone_every, 1..=20, "1 = a backbone in every gap, 2 = in every second gap, …") { hl = Hl::Bones; }
+                    }
+                });
             });
 
         ui.add_space(6.0);
@@ -567,6 +867,26 @@ impl App {
                     if mm_field(ui, "Gap to boards", &mut c.rail_space, 0.0..=20.0, "Distance between rail and board edges (0 for V-cut)") { hl = Hl::RailGap; }
                     if mm_field(ui, "Min panel width", &mut c.min_w, 0.0..=500.0, "Rails grow until the panel is at least this wide (0 = off). Fabs often require ≥ 70 mm for V-cut panels.") { hl = Hl::Rails; }
                     if mm_field(ui, "Min panel height", &mut c.min_h, 0.0..=500.0, "Rails grow until the panel is at least this high (0 = off)") { hl = Hl::Rails; }
+                    advanced(ui, "adv_frame", |ui| {
+                        if mm_field(ui, "Max panel width", &mut c.max_w, 0.0..=1000.0, "Checks shows a problem if the panel gets wider than this (0 = off). Use your fab's or assembler's limit.") { hl = Hl::Rails; }
+                        if mm_field(ui, "Max panel height", &mut c.max_h, 0.0..=1000.0, "Checks shows a problem if the panel gets higher than this (0 = off)") { hl = Hl::Rails; }
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Panel corners");
+                            ui.selectable_value(&mut c.corner, CornerStyle::Square, "Square");
+                            ui.selectable_value(&mut c.corner, CornerStyle::Chamfer, "Chamfer");
+                            ui.selectable_value(&mut c.corner, CornerStyle::Fillet, "Round");
+                        })
+                        .response
+                        .on_hover_text("Shape of the four outer panel corners. Rounded or chamfered corners do not catch in conveyors and packaging.");
+                        if c.corner != CornerStyle::Square {
+                            if mm_field(ui, "Corner size", &mut c.corner_size, 0.2..=20.0, "Chamfer length / corner radius") { hl = Hl::Rails; }
+                        }
+                        let r = ui.checkbox(&mut c.copper_fill, "Fill rails with copper").on_hover_text("Solid copper on both sides of the rails. Evens out plating and makes thin panels stiffer. Kept clear of holes, fiducials and V-cuts.");
+                        if r.hovered() { hl = Hl::Copper; }
+                        if c.copper_fill {
+                            if mm_field(ui, "Copper clearance", &mut c.copper_clearance, 0.2..=5.0, "Distance of the copper from the panel edge, holes, fiducials and V-cut lines") { hl = Hl::Copper; }
+                        }
+                    });
                 }
             });
 
@@ -592,19 +912,47 @@ impl App {
                         if ui.button("Set all spacings to 0 mm").clicked() {
                             c.hspace = 0.0;
                             c.vspace = 0.0;
+                            c.hspace_alt = 0.0;
+                            c.vspace_alt = 0.0;
                             c.rail_space = 0.0;
                         }
+                        advanced(ui, "adv_vcut", |ui| {
+                            if mm_field(ui, "Extend past edge", &mut c.vcut_extend, 0.0..=20.0, "V-cut lines are drawn this far beyond the panel edge, so they are easy to see in the fab drawing") { hl = Hl::VCuts; }
+                        });
                     }
                     _ => {
+                        // the left/right width follows the main width until it is set separately
+                        let old = c.tab_width;
                         if mm_field(ui, "Tab width", &mut c.tab_width, 0.5..=30.0, "Width of each tab along the board edge") { hl = Hl::Tabs; }
-                        if int_field(ui, "Tabs top/bottom", &mut c.tabs_h, 0..=10, "Tabs per top and per bottom board edge") { hl = Hl::Tabs; }
-                        if int_field(ui, "Tabs left/right", &mut c.tabs_v, 0..=10, "Tabs per left and per right board edge") { hl = Hl::Tabs; }
+                        if (c.tab_width_lr - old).abs() < 1e-9 {
+                            c.tab_width_lr = c.tab_width;
+                        }
+                        if c.tab_mode == TabMode::Count {
+                            if int_field(ui, "Tabs top/bottom", &mut c.tabs_h, 0..=10, "Tabs per top and per bottom board edge") { hl = Hl::Tabs; }
+                            if int_field(ui, "Tabs left/right", &mut c.tabs_v, 0..=10, "Tabs per left and per right board edge") { hl = Hl::Tabs; }
+                        } else if mm_field(ui, "Tab every", &mut c.tab_spacing, 2.0..=300.0, "Distance between tabs. The number of tabs per edge follows from the edge length.") {
+                            hl = Hl::Tabs;
+                        }
                         if c.sep == Separation::Mousebites {
                             if mm_field(ui, "Hole Ø", &mut c.mb_drill, 0.2..=2.0, "Mousebite drill diameter (NPTH). 0.5 mm is common.") { hl = Hl::Holes; }
                             if mm_field(ui, "Hole pitch", &mut c.mb_spacing, 0.3..=3.0, "Center-to-center distance of the holes. Web between holes = pitch − Ø.") { hl = Hl::Holes; }
                             if mm_field(ui, "Offset into board", &mut c.mb_offset, -1.0..=1.0, "Hole centers are moved this far into the board, so the broken edge stays inside the outline (no burr).") { hl = Hl::Holes; }
                         }
                         if mm_field(ui, "Router Ø", &mut c.mill_d, 0.5..=3.0, "Fab's milling bit diameter. Gaps between boards must be at least this wide. JLC/PCBWay: ~1.6–2.0 mm.") { hl = Hl::Mill; }
+                        advanced(ui, "adv_tabs", |ui| {
+                            ui.horizontal(|ui| {
+                                field_label(ui, "Place tabs by");
+                                ui.selectable_value(&mut c.tab_mode, TabMode::Count, "Count");
+                                ui.selectable_value(&mut c.tab_mode, TabMode::Spacing, "Distance");
+                            })
+                            .response
+                            .on_hover_text("Count: a fixed number of tabs per edge. Distance: one tab every … mm, so long edges get more tabs.");
+                            if mm_field(ui, "Tab width left/right", &mut c.tab_width_lr, 0.5..=30.0, "Width of the tabs on the left and right board edges, if it should differ from the top / bottom tabs") { hl = Hl::Tabs; }
+                            if c.sep == Separation::Mousebites {
+                                if mm_field(ui, "Holes past tab", &mut c.mb_prolong, 0.0..=5.0, "The hole row is continued this far beyond both ends of the tab, so the break does not tear into the board edge") { hl = Hl::Holes; }
+                            }
+                            if mm_field(ui, "Round inner corners", &mut c.mill_radius, 0.0..=3.0, "Rounds all inner corners of the panel outline with this radius, as the router bit will do (use half the router Ø). 0 = keep sharp corners.") { hl = Hl::Mill; }
+                        });
                     }
                 }
             });
@@ -646,31 +994,75 @@ impl App {
                         ui.selectable_value(&mut c.fid_side, FidSide::Both, "Both");
                     });
                 }
+                if c.framing != Framing::None && (c.tooling != Corners::None || c.fiducials != Corners::None) {
+                    advanced(ui, "adv_tooling", |ui| {
+                        if c.tooling != Corners::None {
+                            if mm_field(ui, "Holes: from edge", &mut c.tool_edge, 0.0..=30.0, "Hole center distance from the outer panel edge, across the rail. 0 = centered on the rail.") { hl = Hl::Tooling; }
+                        }
+                        if c.fiducials != Corners::None {
+                            if mm_field(ui, "Fiducials: from edge", &mut c.fid_edge, 0.0..=30.0, "Fiducial center distance from the outer panel edge, across the rail. 0 = centered on the rail.") { hl = Hl::Fiducials; }
+                        }
+                    });
+                }
             });
 
         ui.add_space(6.0);
         egui::CollapsingHeader::new(section_title("Panel text"))
             .default_open(false)
             .show(ui, |ui| {
-                section_help(ui, "Silkscreen text centered on a rail, e.g. version / date, or JLCJLCJLCJLC to mark where JLC prints its order number.");
-                let r = ui.horizontal(|ui| {
-                    field_label(ui, "Text");
-                    ui.text_edit_singleline(&mut c.text)
-                });
-                if r.inner.hovered() || r.inner.has_focus() { hl = Hl::Text; }
-                if mm_field(ui, "Text height", &mut c.text_size, 0.5..=5.0, "Character height on silkscreen") { hl = Hl::Text; }
-                ui.horizontal(|ui| {
-                    field_label(ui, "Rail");
-                    ui.selectable_value(&mut c.text_pos, TextPos::TopRail, "Top / left");
-                    ui.selectable_value(&mut c.text_pos, TextPos::BottomRail, "Bottom / right");
-                });
+                section_help(ui, "Up to 4 texts on the rails, e.g. version / date, or JLCJLCJLCJLC to mark where JLC prints its order number.\nPlaceholders: {date} {board} {rows} {cols} {count} {width} {height}");
+                let mut remove: Option<usize> = None;
+                for (i, t) in c.texts.iter_mut().enumerate() {
+                    let r = ui.horizontal(|ui| {
+                        field_label(ui, &format!("Text {}", i + 1));
+                        if ui.button("🗑").on_hover_text("Remove this text").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.add_sized([ui.available_width() - 6.0, 22.0], egui::TextEdit::singleline(&mut t.text).hint_text("e.g. {board} {date}"))
+                    });
+                    if r.inner.hovered() || r.inner.has_focus() { hl = Hl::Text; }
+                    if mm_field(ui, "Text height", &mut t.size, 0.5..=5.0, "Character height") { hl = Hl::Text; }
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Rail");
+                        egui::ComboBox::from_id_salt(("text_rail", i)).selected_text(t.rail.label()).show_ui(ui, |ui| {
+                            for v in TextRail::ALL { ui.selectable_value(&mut t.rail, v, v.label()); }
+                        });
+                    })
+                    .response
+                    .on_hover_text("Text on the left / right rail is turned by 90° (reads from bottom to top).");
+                    egui::CollapsingHeader::new(egui::RichText::new("More").color(MUTED)).id_salt(("text_more", i)).default_open(false).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Layer");
+                            egui::ComboBox::from_id_salt(("text_layer", i)).selected_text(t.layer.clone()).show_ui(ui, |ui| {
+                                for l in panel::TEXT_LAYERS { ui.selectable_value(&mut t.layer, l.to_string(), l); }
+                            });
+                        })
+                        .response
+                        .on_hover_text("Silkscreen, copper or solder mask. Text on back layers (B.…) is mirrored, so it reads correctly from the back.");
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Position on rail");
+                            ui.selectable_value(&mut t.justify, Justify::Start, "Start");
+                            ui.selectable_value(&mut t.justify, Justify::Center, "Center");
+                            ui.selectable_value(&mut t.justify, Justify::End, "End");
+                        });
+                        if mm_field(ui, "Shift along rail", &mut t.offset, -500.0..=500.0, "Start / End: distance from that end of the rail. Center: shift away from the middle.") { hl = Hl::Text; }
+                        if mm_field(ui, "Line thickness", &mut t.thickness, 0.0..=1.0, "Stroke width of the letters. 0 = automatic (15 % of the height).") { hl = Hl::Text; }
+                    });
+                    ui.add_space(4.0);
+                }
+                if let Some(i) = remove {
+                    c.texts.remove(i);
+                }
+                if c.texts.len() < panel::MAX_TEXTS && ui.button("+  Add text").clicked() {
+                    c.texts.push(TextCfg::default());
+                }
             });
 
         ui.add_space(6.0);
         egui::CollapsingHeader::new(section_title("Output file"))
             .default_open(true)
             .show(ui, |ui| {
-                section_help(ui, "Where the panel is written. Empty folder = <project>/panel. Relative paths are relative to the project folder. Each board copy gets its own nets (Board_N-…), Edge.Cuts becomes the panel outline.");
+                section_help(ui, "Where the panel is written. Empty folder = <project>/panel. Relative paths are relative to the project folder. Edge.Cuts becomes the panel outline.");
                 if path_field(ui, "Folder", &mut c.out_dir, "<project>/panel", "Output folder for the panel files") {
                     pending = Some(Pending::BrowseOutDir);
                 }
@@ -691,13 +1083,26 @@ impl App {
                         }
                     });
                 }).response.on_hover_text("Layer for V-cut lines. Tell your fab which layer it is (JLC: note in the order).");
-                ui.checkbox(&mut c.rename_refs, "Rename references per board (R1 becomes R1_2)")
-                    .on_hover_text("Unique reference designators — needed by some assembly services when the panel is assembled as one BOM.");
                 ui.horizontal(|ui| {
                     field_label(ui, "Panel position");
                     ui.add(egui::DragValue::new(&mut c.origin.0).speed(1.0).prefix("x ").suffix(" mm"));
                     ui.add(egui::DragValue::new(&mut c.origin.1).speed(1.0).prefix("y ").suffix(" mm"));
                 }).response.on_hover_text("Top-left corner of the panel on the KiCad page");
+                advanced(ui, "adv_output", |ui| {
+                    text_field(ui, "Net names", &mut c.net_template, "Board_{n}-{orig}", "Name of each net in the panel. {n} = board number, {orig} = original net name. With {n}, every board keeps its own nets.");
+                    text_field(ui, "References", &mut c.ref_template, "{orig}", "Reference designator of each part. {orig} keeps R1 on every board; {orig}_{n} gives R1_1, R1_2, … (needed by some assembly services).");
+                    mm_field(ui, "Outline line width", &mut c.edge_width, 0.01..=1.0, "Line width of the panel outline on Edge.Cuts");
+                    ui.checkbox(&mut c.page_fit, "Fit page size to the panel")
+                        .on_hover_text("Sets a custom page size around the panel, with the panel position as margin. Otherwise the page of your board is kept.");
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Drill / place origin");
+                        ui.selectable_value(&mut c.aux_origin, OriginCorner::None, "Keep");
+                        ui.selectable_value(&mut c.aux_origin, OriginCorner::TopLeft, "Top left");
+                        ui.selectable_value(&mut c.aux_origin, OriginCorner::BottomLeft, "Bottom left");
+                    })
+                    .response
+                    .on_hover_text("Moves the drill / place file origin and the grid origin to a panel corner. Assembly houses usually want bottom left.");
+                });
             });
 
         ui.add_space(6.0);
@@ -765,6 +1170,42 @@ impl App {
         }
     }
 
+    /// "2D | 3D" switch in the top-left corner of the preview, and the mouse hint at the bottom
+    fn view_switch(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+        let hint = if self.view3d {
+            "drag = rotate  ·  right-drag or Shift+drag = move  ·  wheel = zoom  ·  double-click = reset"
+        } else {
+            "drag = pan  ·  wheel = zoom  ·  double-click = fit"
+        };
+        painter.text(rect.left_bottom() + Vec2::new(10.0, -8.0), egui::Align2::LEFT_BOTTOM, hint, egui::FontId::proportional(12.5), Color32::from_rgb(110, 130, 170));
+
+        let area = Rect::from_min_size(rect.min + Vec2::new(10.0, 10.0), egui::vec2(92.0, 30.0));
+        painter.rect_filled(area, 6.0, Color32::from_rgb(27, 30, 36));
+        let modes = [
+            (false, "2D", "Flat view"),
+            (true, "3D", "Rotatable 3D view of the panel with the components of your board. The components are fetched from KiCad once per board, which takes a few seconds; until then the bare panel is shown."),
+        ];
+        for (i, (is3d, label, tip)) in modes.into_iter().enumerate() {
+            let r = Rect::from_min_size(area.min + Vec2::new(3.0 + 44.0 * i as f32, 3.0), egui::vec2(42.0, 24.0));
+            if ui.put(r, egui::SelectableLabel::new(self.view3d == is3d, label)).on_hover_text(tip).clicked() {
+                if self.view3d != is3d {
+                    self.view3d = is3d;
+                    self.fit_pending = true;
+                }
+            }
+        }
+        if self.view3d {
+            let gl_err = self.gl3d.error();
+            let (text, col) = match (&self.model, gl_err) {
+                (ModelLoad::Loading(_), _) => ("⏳ Fetching the components from KiCad…".to_string(), DIM),
+                (ModelLoad::Failed(e), _) => (format!("Components not shown: {}", elide_middle(e.trim_start_matches("kicad-cli failed: "), 110)), WARN_TEXT),
+                (_, Some(e)) => (format!("Components not shown (graphics driver): {}", elide_middle(&e, 90)), WARN_TEXT),
+                _ => (String::new(), DIM),
+            };
+            painter.text(area.right_center() + Vec2::new(12.0, 0.0), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(13.5), col);
+        }
+    }
+
     fn preview(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
@@ -783,17 +1224,37 @@ impl App {
         };
         let p = panel::build(o, &self.cfg);
         let sep = panel::separation(&p, &self.cfg);
-        let feats = panel::features(&p, &self.cfg, &sep.vcuts);
+        let feats = panel::features(&p, &self.cfg, &sep.vcuts, &self.board_stem);
         self.warnings = sep.warnings.clone();
         self.warnings.extend(feats.warnings.iter().cloned());
         let (pw, ph) = p.size;
 
+        // exact final outline (corner shapes, rounded inner corners); cached, the union is not free
+        let geo: Option<std::rc::Rc<export::OutlineGeo>> = if p.boards.len() <= OUTLINE_PREVIEW_MAX {
+            let key = serde_json::to_string(&self.cfg).unwrap_or_default();
+            if self.outline_cache.as_ref().map(|c| c.0 != key).unwrap_or(true) {
+                self.outline_cache = Some((key, std::rc::Rc::new(export::outline_geo(&p, &sep, &self.cfg))));
+            }
+            self.outline_cache.as_ref().map(|c| c.1.clone())
+        } else {
+            None
+        };
+        let rings = geo.as_ref().map(|g| &g.rings);
+
         if self.fit_pending {
-            self.zoom = (rect.width() / pw as f32).min(rect.height() / ph as f32) * 0.85;
+            // a turned panel needs more room than a flat one
+            let margin = if self.view3d { 0.6 } else { 0.85 };
+            self.zoom = (rect.width() / pw as f32).min(rect.height() / ph as f32) * margin;
             self.pan = Vec2::ZERO;
             self.fit_pending = false;
         }
-        if resp.dragged() {
+        if self.view3d && matches!(self.model, ModelLoad::Idle) && self.source.is_some() {
+            self.start_model(ui.ctx());
+        }
+        let shift = ui.input(|i| i.modifiers.shift);
+        if self.view3d && resp.dragged_by(egui::PointerButton::Primary) && !shift {
+            self.cam.rotate(resp.drag_delta());
+        } else if resp.dragged() {
             self.pan += resp.drag_delta();
         }
         if let Some(hover) = resp.hover_pos() {
@@ -807,6 +1268,78 @@ impl App {
         }
         if resp.double_clicked() {
             self.fit_pending = true;
+            self.cam = view3d::Camera::default();
+        }
+
+        // areas that belong to the hovered setting
+        let hole_boxes = || -> Vec<RectMm> {
+            sep.holes.iter().map(|&(c, d)| RectMm::new(c.0 - d / 2.0, c.1 - d / 2.0, c.0 + d / 2.0, c.1 + d / 2.0)).collect()
+        };
+        let hl_rects: Vec<RectMm> = match self.hl {
+            Hl::Tabs => sep.tabs.clone(),
+            Hl::Holes => hole_boxes(),
+            Hl::Mill => p.hgaps.iter().chain(p.vgaps.iter()).chain(p.rail_gaps.iter()).copied().collect(),
+            Hl::VCuts => vec![],
+            Hl::Tooling => feats.items.iter().filter(|f| f.kind == FeatureKind::Tooling).map(|f| RectMm::new(f.pos.0 - f.r, f.pos.1 - f.r, f.pos.0 + f.r, f.pos.1 + f.r)).collect(),
+            Hl::Fiducials => feats.items.iter().filter(|f| f.kind != FeatureKind::Tooling).map(|f| RectMm::new(f.pos.0 - f.r, f.pos.1 - f.r, f.pos.0 + f.r, f.pos.1 + f.r)).collect(),
+            Hl::Text => feats.texts.iter().map(|t| t.rect).collect(),
+            Hl::Bones => p.bones.clone(),
+            Hl::Copper => feats.copper.clone(),
+            Hl::HSpace => p.hgaps.clone(),
+            Hl::VSpace => p.vgaps.clone(),
+            Hl::Rails => p.rails.clone(),
+            Hl::RailGap => p.rail_gaps.clone(),
+            Hl::Grid => p.boards.iter().map(|b| b.bbox).collect(),
+            Hl::None => vec![],
+        };
+        // DRC findings in panel coordinates (the file is shifted by the panel position)
+        let marks: Vec<((f64, f64), bool)> = match (self.show_drc, &self.drc) {
+            (true, Some(r)) => r.items.iter().filter_map(|it| it.pos.map(|(x, y)| ((x - self.cfg.origin.0, y - self.cfg.origin.1), it.error))).collect(),
+            _ => Vec::new(),
+        };
+
+        if self.view3d {
+            // with the board model loaded, OpenGL draws the panel body and the boards
+            let gl = match (&geo, &self.outline_cache) {
+                (Some(_), Some((key, _))) if self.gl3d.has_model() && self.gl3d.error().is_none() => {
+                    let view = gl3d::View { cam: &self.cam, zoom: self.zoom, origin: rect.center() + self.pan, rect };
+                    let cfg = &self.cfg;
+                    Some(self.gl3d.callback(&view, &p, || export::frame_geo(&p, &sep, cfg), &format!("{key}|{}", self.thickness), self.thickness))
+                }
+                _ => None,
+            };
+            match &geo {
+                Some(g) => view3d::draw(
+                    &painter,
+                    rect,
+                    &view3d::Scene {
+                        cam: &self.cam,
+                        zoom: self.zoom,
+                        origin: rect.center() + self.pan,
+                        geo: g,
+                        panel: &p,
+                        sep: &sep,
+                        feats: &feats,
+                        cfg: &self.cfg,
+                        thickness: self.thickness,
+                        hl: &hl_rects,
+                        marks: &marks,
+                        vcut_bold: self.hl == Hl::VCuts,
+                    },
+                    gl,
+                ),
+                None => {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("The 3D view is switched off for panels with more than {OUTLINE_PREVIEW_MAX} boards."),
+                        egui::FontId::proportional(15.0),
+                        DIM,
+                    );
+                }
+            }
+            self.view_switch(ui, &painter, rect);
+            return;
         }
 
         let zoom = self.zoom;
@@ -820,12 +1353,18 @@ impl App {
         // rails
         for r in &p.rails {
             painter.rect_filled(srect(r), 0.0, SUBSTRATE);
-            painter.rect_stroke(srect(r), 0.0, Stroke::new(1.0_f32, EDGE), egui::StrokeKind::Middle);
+            if rings.is_none() {
+                painter.rect_stroke(srect(r), 0.0, Stroke::new(1.0_f32, EDGE), egui::StrokeKind::Middle);
+            }
         }
 
-        // extra substrate: tabs + filled gaps
-        for r in sep.tabs.iter().chain(sep.fills.iter()) {
+        // extra substrate: tabs, filled gaps, backbones
+        for r in sep.tabs.iter().chain(sep.fills.iter()).chain(p.bones.iter()) {
             painter.rect_filled(srect(r), 0.0, SUBSTRATE);
+        }
+        // copper fill on the rails
+        for r in &feats.copper {
+            painter.rect_filled(srect(r), 0.0, COPPER);
         }
 
         // boards: fill (ear clipping) + outline
@@ -841,8 +1380,15 @@ impl App {
                     mesh.add_triangle(t[0] as u32, t[1] as u32, t[2] as u32);
                 }
                 painter.add(egui::Shape::mesh(mesh));
-                painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2_f32, EDGE)));
+                if rings.is_none() {
+                    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2_f32, EDGE)));
+                }
             }
+        }
+        // what the fab will cut: the final outline
+        for r in rings.into_iter().flatten() {
+            let pts: Vec<Pos2> = r.iter().map(|&q| ts(q)).collect();
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2_f32, EDGE)));
         }
 
         // mousebite holes
@@ -875,35 +1421,28 @@ impl App {
                 }
             }
         }
-        if let Some(t) = &feats.text {
-            painter.text(
-                ts(t.pos),
-                egui::Align2::CENTER_CENTER,
-                &t.text,
-                egui::FontId::monospace((t.size as f32 * zoom * 1.1).max(4.0)),
-                Color32::from_rgb(235, 235, 235),
-            );
+        for t in &feats.texts {
+            let col = if t.layer.ends_with(".Cu") {
+                Color32::from_rgb(230, 190, 80)
+            } else if t.layer.starts_with("B.") {
+                Color32::from_rgb(150, 190, 255)
+            } else {
+                Color32::from_rgb(235, 235, 235)
+            };
+            let center = srect(&t.rect).center();
+            let font = egui::FontId::monospace((t.size as f32 * zoom * 1.1).max(4.0));
+            if t.angle == 0.0 {
+                painter.text(center, egui::Align2::CENTER_CENTER, &t.text, font, col);
+            } else {
+                // reads bottom to top; the shape turns around the galley's top-left corner
+                let g = painter.layout_no_wrap(t.text.clone(), font, col);
+                let (gw, gh) = (g.size().x, g.size().y);
+                let pos = Pos2::new(center.x - gh / 2.0, center.y + gw / 2.0);
+                painter.add(egui::epaint::TextShape::new(pos, g, col).with_angle(-std::f32::consts::FRAC_PI_2));
+            }
         }
 
         // highlight
-        let hole_boxes = || -> Vec<RectMm> {
-            sep.holes.iter().map(|&(c, d)| RectMm::new(c.0 - d / 2.0, c.1 - d / 2.0, c.0 + d / 2.0, c.1 + d / 2.0)).collect()
-        };
-        let hl_rects: Vec<RectMm> = match self.hl {
-            Hl::Tabs => sep.tabs.clone(),
-            Hl::Holes => hole_boxes(),
-            Hl::Mill => p.hgaps.iter().chain(p.vgaps.iter()).chain(p.rail_gaps.iter()).copied().collect(),
-            Hl::VCuts => vec![],
-            Hl::Tooling => feats.items.iter().filter(|f| f.kind == FeatureKind::Tooling).map(|f| RectMm::new(f.pos.0 - f.r, f.pos.1 - f.r, f.pos.0 + f.r, f.pos.1 + f.r)).collect(),
-            Hl::Fiducials => feats.items.iter().filter(|f| f.kind != FeatureKind::Tooling).map(|f| RectMm::new(f.pos.0 - f.r, f.pos.1 - f.r, f.pos.0 + f.r, f.pos.1 + f.r)).collect(),
-            Hl::Text => feats.text.iter().map(|t| t.rect).collect(),
-            Hl::HSpace => p.hgaps.clone(),
-            Hl::VSpace => p.vgaps.clone(),
-            Hl::Rails => p.rails.clone(),
-            Hl::RailGap => p.rail_gaps.clone(),
-            Hl::Grid => p.boards.iter().map(|b| b.bbox).collect(),
-            Hl::None => vec![],
-        };
         for r in &hl_rects {
             let sr = srect(r);
             // make zero-width gaps visible
@@ -911,6 +1450,15 @@ impl App {
             let sr = if sr.height() < 2.0 { sr.expand2(Vec2::new(0.0, 2.0)) } else { sr };
             painter.rect_filled(sr, 0.0, HL);
             painter.rect_stroke(sr, 0.0, Stroke::new(1.0_f32, HL_STROKE), egui::StrokeKind::Middle);
+        }
+
+        // DRC findings
+        for &(q, error) in &marks {
+            let c = ts(q);
+            let col = if error { BAD } else { WARN_TEXT };
+            painter.circle_stroke(c, 7.0, Stroke::new(2.0_f32, col));
+            painter.line_segment([c - Vec2::splat(4.0), c + Vec2::splat(4.0)], Stroke::new(2.0_f32, col));
+            painter.line_segment([c + Vec2::new(-4.0, 4.0), c + Vec2::new(4.0, -4.0)], Stroke::new(2.0_f32, col));
         }
 
         // panel dimensions
@@ -923,19 +1471,16 @@ impl App {
             egui::FontId::proportional(15.0),
             DIM,
         );
-        painter.text(
-            rect.left_bottom() + Vec2::new(10.0, -8.0),
-            egui::Align2::LEFT_BOTTOM,
-            "drag = pan  ·  wheel = zoom  ·  double-click = fit",
-            egui::FontId::proportional(12.5),
-            Color32::from_rgb(110, 130, 170),
-        );
+        self.view_switch(ui, &painter, rect);
         let _ = p.area;
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job(ctx);
+        self.poll_model();
+
         // ---------- shortcuts
         if self.source.is_some() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
@@ -1017,14 +1562,54 @@ impl eframe::App for App {
                         let errors = self.warnings.iter().filter(|w| w.starts_with('⚠')).count();
                         let notes = self.warnings.len() - errors;
 
+                        // what the last automatic fix changed, with a way back
+                        let mut undo = false;
+                        let mut dismiss = false;
+                        if let Some((changes, _)) = &self.fix_log {
+                            egui::Frame::NONE.fill(Color32::from_rgb(22, 50, 34)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
+                                ui.set_width(ui.available_width() - 4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("🔧 Adjusted {} setting(s)", changes.len())).strong().color(OK_TEXT));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        dismiss = ui.small_button("OK").on_hover_text("Keep the changes and hide this list").clicked();
+                                        undo = ui.small_button("Undo").on_hover_text("Put all settings back as they were before the fix").clicked();
+                                    });
+                                });
+                                egui::ScrollArea::vertical().id_salt("fixlog").max_height(96.0).auto_shrink([false, true]).show(ui, |ui| {
+                                    for c in changes {
+                                        ui.label(egui::RichText::new(format!("• {c}")).small().color(Color32::from_rgb(190, 225, 195)));
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if undo {
+                            if let Some((_, before)) = self.fix_log.take() {
+                                self.cfg = before;
+                                self.notice = Notice::ok("✔ Automatic fix undone");
+                                self.fit_pending = true;
+                            }
+                        } else if dismiss {
+                            self.fix_log = None;
+                        }
+
                         // checks
+                        let mut fix = false;
                         if !self.warnings.is_empty() {
                             let title = if errors > 0 {
                                 egui::RichText::new(format!("⚠ Checks — {errors} problem(s), {notes} note(s)")).color(ERR_TEXT)
                             } else {
                                 egui::RichText::new(format!("Checks — {notes} note(s)")).color(WARN_TEXT)
                             };
-                            ui.label(title.strong().size(15.5));
+                            ui.horizontal(|ui| {
+                                ui.label(title.strong().size(15.5));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    fix = ui
+                                        .button("🔧  Fix automatically")
+                                        .on_hover_text("Adjusts the settings so the problems below go away: wider gaps or rails, narrower tabs, moved holes, fiducials and texts, …\nYou see what was changed and can undo it.")
+                                        .clicked();
+                                });
+                            });
                             egui::ScrollArea::vertical().id_salt("checks").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
                                 for w in &self.warnings {
                                     let err = w.starts_with('⚠');
@@ -1042,6 +1627,9 @@ impl eframe::App for App {
                             });
                         } else if has_board {
                             ui.label(egui::RichText::new("✔ Checks — no problems").strong().size(15.5).color(OK_TEXT));
+                        }
+                        if fix {
+                            self.auto_fix();
                         }
                         ui.add_space(8.0);
 
@@ -1089,6 +1677,64 @@ impl eframe::App for App {
                                 self.open_in_kicad();
                             }
                         });
+
+                        // tools that run KiCad's own checks / 3D export on the exported panel file
+                        ui.add_space(8.0);
+                        if let Some((job, _)) = &self.job {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(egui::RichText::new(job.label()).color(MUTED));
+                            });
+                        } else {
+                            let ready = has_board && self.panel_file().is_some();
+                            let mut start: Option<tools::Job> = None;
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 2.0 * 8.0) / 3.0;
+                                let hint = "Export the panel first";
+                                let cell = egui::Layout::top_down_justified(egui::Align::Center);
+                                ui.add_enabled_ui(ready, |ui| {
+                                    if ui
+                                        .add(egui::Button::new("✔  Check (DRC)").min_size(egui::vec2(w, 32.0)))
+                                        .on_hover_text("Run KiCad's design rule check on the exported panel and list what it finds.\nIt checks the exported file: export again after changing settings.")
+                                        .on_disabled_hover_text(hint)
+                                        .clicked()
+                                    {
+                                        start = Some(tools::Job::Drc);
+                                    }
+                                    ui.allocate_ui_with_layout(egui::vec2(w, 32.0), cell, |ui| {
+                                        ui.menu_button("3D picture  ⏷", |ui| {
+                                            for v in tools::View::ALL {
+                                                if ui.button(v.label()).clicked() {
+                                                    start = Some(tools::Job::Render { view: v, high: self.cfg.render_high });
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                            ui.separator();
+                                            ui.checkbox(&mut self.cfg.render_high, "High quality (slow)");
+                                        })
+                                        .response
+                                        .on_hover_text("Render the exported panel in 3D and save it as a PNG next to the panel file")
+                                        .on_disabled_hover_text(hint);
+                                    });
+                                    ui.allocate_ui_with_layout(egui::vec2(w, 32.0), cell, |ui| {
+                                        ui.menu_button("3D model  ⏷", |ui| {
+                                            for m in tools::Model::ALL {
+                                                if ui.button(m.label()).clicked() {
+                                                    start = Some(tools::Job::Model(m));
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("Export the panel as a 3D model file next to the panel file. Large panels can take a few minutes.")
+                                        .on_disabled_hover_text(hint);
+                                    });
+                                });
+                            });
+                            if let Some(j) = start {
+                                self.start_job(ctx, j);
+                            }
+                        }
                     });
 
                 // settings fill the rest
@@ -1103,6 +1749,9 @@ impl eframe::App for App {
                     });
             });
         self.run_pending();
+        self.drc_window(ctx);
+        self.render_window(ctx);
+        self.save_render_copy();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -1116,6 +1765,9 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("KiPanel"),
+        // the 3D view needs a depth buffer; 4 samples smooth its edges
+        depth_buffer: 24,
+        multisampling: 4,
         ..Default::default()
     };
     eframe::run_native(

@@ -5,13 +5,13 @@
   "description_full": "Panelize the open board with a live preview: grid, rails/frame, V-cut, tabs + mousebites, tooling holes, fiducials, panel text. Exports a new .kicad_pcb.",
   "identifier": "com.mubin.kipanel",
   "type": "plugin",
-  "author": { "name": "Mubin", "contact": {} },
+  "author": { "name": "Mubin", "contact": { "web": "https://github.com/kahlenberg/kipanel" } },
   "license": "MIT",
-  "resources": {},
+  "resources": { "homepage": "https://github.com/kahlenberg/kipanel" },
   "versions": [
     {
-      "version": "0.1.0",
-      "status": "development",
+      "version": "1.0.0",
+      "status": "stable",
       "kicad_version": "9.0",
       "platforms": ["@PLATFORM@"],
       "runtime": "ipc"

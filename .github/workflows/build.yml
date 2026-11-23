@@ -45,9 +45,10 @@ jobs:
           path: dist/kipanel-pcm-${{ matrix.platform }}.zip
           if-no-files-found: error
 
-      # pushing a tag like v0.1.0 publishes the zips as a GitHub release
+      # pushing a tag like v1.0.0 publishes the zips as a GitHub release
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/kipanel-pcm-${{ matrix.platform }}.zip
+          generate_release_notes: true
