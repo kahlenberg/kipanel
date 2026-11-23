@@ -6,6 +6,8 @@ A PCB panelizer plugin for **KiCad 9+** with a live preview. Open your board, cl
 
 Written in Rust (egui), talks to KiCad through the IPC API. Runs on Windows, Linux and macOS.
 
+![KiPanel: growing a panel and turning it in the 3D view](docs/demo.gif)
+
 ![KiPanel window with a 3 x 2 panel](docs/screenshot.png)
 
 | 3D preview with components | Live checks and automatic fixes |
@@ -111,7 +113,9 @@ KICAD_VERSION=10.0 ./install-dev.sh          # a different KiCad version
 KICAD_PLUGIN_DIR=~/.var/app/org.kicad.KiCad/data/kicad/9.0/plugins ./install-dev.sh
 ```
 
-To uninstall, delete the `com.mubin.kipanel` folder.
+A package installed through the Plugin and Content Manager (option A) lives in `3rdparty/plugins/com_mubin_kipanel` next to that `plugins` folder instead.
+
+To uninstall, delete the `com.mubin.kipanel` folder, or remove KiPanel in the Plugin and Content Manager if you installed the package.
 
 ## Usage
 
